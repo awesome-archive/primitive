@@ -17,23 +17,33 @@ import (
 )
 
 func LoadImage(path string) (image.Image, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, err
+	if path == "-" {
+		im, _, err := image.Decode(os.Stdin)
+		return im, err
+	} else {
+		file, err := os.Open(path)
+		if err != nil {
+			return nil, err
+		}
+		defer file.Close()
+		im, _, err := image.Decode(file)
+		return im, err
 	}
-	defer file.Close()
-	im, _, err := image.Decode(file)
-	return im, err
 }
 
 func SaveFile(path, contents string) error {
-	file, err := os.Create(path)
-	if err != nil {
+	if path == "-" {
+		_, err := fmt.Fprint(os.Stdout, contents)
+		return err
+	} else {
+		file, err := os.Create(path)
+		if err != nil {
+			return err
+		}
+		defer file.Close()
+		_, err = file.WriteString(contents)
 		return err
 	}
-	defer file.Close()
-	_, err = file.WriteString(contents)
-	return err
 }
 
 func SavePNG(path string, im image.Image) error {
@@ -98,12 +108,33 @@ func SaveGIFImageMagick(path string, frames []image.Image, delay, lastDelay int)
 	return os.RemoveAll(dir)
 }
 
+func NumberString(x float64) string {
+	suffixes := []string{"", "k", "M", "G"}
+	for _, suffix := range suffixes {
+		if x < 1000 {
+			return fmt.Sprintf("%.1f%s", x, suffix)
+		}
+		x /= 1000
+	}
+	return fmt.Sprintf("%.1f%s", x, "T")
+}
+
 func radians(degrees float64) float64 {
 	return degrees * math.Pi / 180
 }
 
 func degrees(radians float64) float64 {
 	return radians * 180 / math.Pi
+}
+
+func clamp(x, lo, hi float64) float64 {
+	if x < lo {
+		return lo
+	}
+	if x > hi {
+		return hi
+	}
+	return x
 }
 
 func clampInt(x, lo, hi int) int {

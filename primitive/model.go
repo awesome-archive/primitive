@@ -3,62 +3,60 @@ package primitive
 import (
 	"fmt"
 	"image"
-	"math/rand"
 	"strings"
 
 	"github.com/fogleman/gg"
 )
 
 type Model struct {
-	W, H       int
+	Sw, Sh     int
+	Scale      float64
 	Background Color
 	Target     *image.RGBA
 	Current    *image.RGBA
-	Buffer     *image.RGBA
 	Context    *gg.Context
 	Score      float64
-	Alpha      int
-	Size       int
-	Mode       Mode
 	Shapes     []Shape
+	Colors     []Color
 	Scores     []float64
-	SVGs       []string
+	Workers    []*Worker
 }
 
-func NewModel(target image.Image, background Color, alpha, size int, mode Mode) *Model {
+func NewModel(target image.Image, background Color, size, numWorkers int) *Model {
+	w := target.Bounds().Size().X
+	h := target.Bounds().Size().Y
+	aspect := float64(w) / float64(h)
+	var sw, sh int
+	var scale float64
+	if aspect >= 1 {
+		sw = size
+		sh = int(float64(size) / aspect)
+		scale = float64(size) / float64(w)
+	} else {
+		sw = int(float64(size) * aspect)
+		sh = size
+		scale = float64(size) / float64(h)
+	}
+
 	model := &Model{}
-	model.W = target.Bounds().Size().X
-	model.H = target.Bounds().Size().Y
+	model.Sw = sw
+	model.Sh = sh
+	model.Scale = scale
 	model.Background = background
-	model.Alpha = alpha
-	model.Size = size
-	model.Mode = mode
 	model.Target = imageToRGBA(target)
 	model.Current = uniformRGBA(target.Bounds(), background.NRGBA())
-	model.Buffer = uniformRGBA(target.Bounds(), background.NRGBA())
 	model.Score = differenceFull(model.Target, model.Current)
 	model.Context = model.newContext()
+	for i := 0; i < numWorkers; i++ {
+		worker := NewWorker(model.Target)
+		model.Workers = append(model.Workers, worker)
+	}
 	return model
 }
 
-func (model *Model) sizeAndScale() (w, h int, scale float64) {
-	aspect := float64(model.W) / float64(model.H)
-	if aspect >= 1 {
-		w = model.Size
-		h = int(float64(model.Size) / aspect)
-		scale = float64(model.Size) / float64(model.W)
-	} else {
-		w = int(float64(model.Size) * aspect)
-		h = model.Size
-		scale = float64(model.Size) / float64(model.H)
-	}
-	return
-}
-
 func (model *Model) newContext() *gg.Context {
-	w, h, scale := model.sizeAndScale()
-	dc := gg.NewContext(w, h)
-	dc.Scale(scale, scale)
+	dc := gg.NewContext(model.Sw, model.Sh)
+	dc.Scale(model.Scale, model.Scale)
 	dc.Translate(0.5, 0.5)
 	dc.SetColor(model.Background.NRGBA())
 	dc.Clear()
@@ -71,9 +69,9 @@ func (model *Model) Frames(scoreDelta float64) []image.Image {
 	result = append(result, imageToRGBA(dc.Image()))
 	previous := 10.0
 	for i, shape := range model.Shapes {
-		c := model.computeColor(shape.Rasterize(), model.Alpha)
+		c := model.Colors[i]
 		dc.SetRGBA255(c.R, c.G, c.B, c.A)
-		shape.Draw(dc)
+		shape.Draw(dc, model.Scale)
 		dc.Fill()
 		score := model.Scores[i]
 		delta := previous - score
@@ -86,55 +84,83 @@ func (model *Model) Frames(scoreDelta float64) []image.Image {
 }
 
 func (model *Model) SVG() string {
-	w, h, scale := model.sizeAndScale()
-	c := model.Background
+	bg := model.Background
 	var lines []string
-	lines = append(lines, fmt.Sprintf("<svg xmlns=\"http://www.w3.org/2000/svg\" version=\"1.1\" width=\"%d\" height=\"%d\">", w, h))
-	lines = append(lines, fmt.Sprintf("<rect x=\"0\" y=\"0\" width=\"%d\" height=\"%d\" fill=\"#%02x%02x%02x\" />", w, h, c.R, c.G, c.B))
-	lines = append(lines, fmt.Sprintf("<g transform=\"scale(%f) translate(0.5 0.5)\">", scale))
-	lines = append(lines, model.SVGs...)
+	lines = append(lines, fmt.Sprintf("<svg xmlns=\"http://www.w3.org/2000/svg\" version=\"1.1\" width=\"%d\" height=\"%d\">", model.Sw, model.Sh))
+	lines = append(lines, fmt.Sprintf("<rect x=\"0\" y=\"0\" width=\"%d\" height=\"%d\" fill=\"#%02x%02x%02x\" />", model.Sw, model.Sh, bg.R, bg.G, bg.B))
+	lines = append(lines, fmt.Sprintf("<g transform=\"scale(%f) translate(0.5 0.5)\">", model.Scale))
+	for i, shape := range model.Shapes {
+		c := model.Colors[i]
+		attrs := "fill=\"#%02x%02x%02x\" fill-opacity=\"%f\""
+		attrs = fmt.Sprintf(attrs, c.R, c.G, c.B, float64(c.A)/255)
+		lines = append(lines, shape.SVG(attrs))
+	}
 	lines = append(lines, "</g>")
 	lines = append(lines, "</svg>")
 	return strings.Join(lines, "\n")
 }
 
-func (model *Model) Add(shape Shape) {
+func (model *Model) Add(shape Shape, alpha int) {
+	before := copyRGBA(model.Current)
 	lines := shape.Rasterize()
-	c := model.computeColor(lines, model.Alpha)
-	s := model.computeScore(lines, c, model.Buffer)
-	Draw(model.Current, c, lines)
+	color := computeColor(model.Target, model.Current, lines, alpha)
+	drawLines(model.Current, color, lines)
+	score := differencePartial(model.Target, before, model.Current, model.Score, lines)
 
-	attrs := "fill=\"#%02x%02x%02x\" fill-opacity=\"%f\""
-	attrs = fmt.Sprintf(attrs, c.R, c.G, c.B, float64(c.A)/255)
-	svg := shape.SVG(attrs)
-
-	model.Score = s
+	model.Score = score
 	model.Shapes = append(model.Shapes, shape)
-	model.Scores = append(model.Scores, s)
-	model.SVGs = append(model.SVGs, svg)
+	model.Colors = append(model.Colors, color)
+	model.Scores = append(model.Scores, score)
 
-	model.Context.SetRGBA255(c.R, c.G, c.B, c.A)
-	shape.Draw(model.Context)
-	model.Context.Fill()
+	model.Context.SetRGBA255(color.R, color.G, color.B, color.A)
+	shape.Draw(model.Context, model.Scale)
 }
 
-func (model *Model) Step() {
-	state := model.BestHillClimbState(model.Buffer, model.Mode, 100, 100, 10)
-	// state := model.BestRandomState(model.Buffer, model.Mode, 1000)
-	// state = Anneal(state, 0.1, 0.00001, 25000).(*State)
-	state = HillClimb(state, 1000).(*State)
-	model.Add(state.Shape)
+func (model *Model) Step(shapeType ShapeType, alpha, repeat int) int {
+	state := model.runWorkers(shapeType, alpha, 1000, 100, 16)
+	// state = HillClimb(state, 1000).(*State)
+	model.Add(state.Shape, state.Alpha)
+
+	for i := 0; i < repeat; i++ {
+		state.Worker.Init(model.Current, model.Score)
+		a := state.Energy()
+		state = HillClimb(state, 100).(*State)
+		b := state.Energy()
+		if a == b {
+			break
+		}
+		model.Add(state.Shape, state.Alpha)
+	}
+
+	// for _, w := range model.Workers[1:] {
+	// 	model.Workers[0].Heatmap.AddHeatmap(w.Heatmap)
+	// }
+	// SavePNG("heatmap.png", model.Workers[0].Heatmap.Image(0.5))
+
+	counter := 0
+	for _, worker := range model.Workers {
+		counter += worker.Counter
+	}
+	return counter
 }
 
-func (model *Model) BestHillClimbState(buffer *image.RGBA, t Mode, n, age, m int) *State {
+func (model *Model) runWorkers(t ShapeType, a, n, age, m int) *State {
+	wn := len(model.Workers)
+	ch := make(chan *State, wn)
+	wm := m / wn
+	if m%wn != 0 {
+		wm++
+	}
+	for i := 0; i < wn; i++ {
+		worker := model.Workers[i]
+		worker.Init(model.Current, model.Score)
+		go model.runWorker(worker, t, a, n, age, wm, ch)
+	}
 	var bestEnergy float64
 	var bestState *State
-	for i := 0; i < m; i++ {
-		state := model.BestRandomState(buffer, t, n)
-		before := state.Energy()
-		state = HillClimb(state, age).(*State)
+	for i := 0; i < wn; i++ {
+		state := <-ch
 		energy := state.Energy()
-		vv("%dx random: %.6f -> %dx hill climb: %.6f\n", n, before, age, energy)
 		if i == 0 || energy < bestEnergy {
 			bestEnergy = energy
 			bestState = state
@@ -143,75 +169,6 @@ func (model *Model) BestHillClimbState(buffer *image.RGBA, t Mode, n, age, m int
 	return bestState
 }
 
-func (model *Model) BestRandomState(buffer *image.RGBA, t Mode, n int) *State {
-	var bestEnergy float64
-	var bestState *State
-	for i := 0; i < n; i++ {
-		state := model.RandomState(buffer, t)
-		energy := state.Energy()
-		if i == 0 || energy < bestEnergy {
-			bestEnergy = energy
-			bestState = state
-		}
-	}
-	return bestState
-}
-
-func (model *Model) RandomState(buffer *image.RGBA, t Mode) *State {
-	switch t {
-	default:
-		return model.RandomState(buffer, Mode(rand.Intn(5)+1))
-	case ModeTriangle:
-		return NewState(model, buffer, NewRandomTriangle(model.W, model.H))
-	case ModeRectangle:
-		return NewState(model, buffer, NewRandomRectangle(model.W, model.H))
-	case ModeEllipse:
-		return NewState(model, buffer, NewRandomEllipse(model.W, model.H))
-	case ModeCircle:
-		return NewState(model, buffer, NewRandomCircle(model.W, model.H))
-	case ModeRotatedRectangle:
-		return NewState(model, buffer, NewRandomRotatedRectangle(model.W, model.H))
-	}
-}
-
-func (model *Model) computeColor(lines []Scanline, alpha int) Color {
-	var count int
-	var rsum, gsum, bsum float64
-	a := float64(alpha) / 255
-	for _, line := range lines {
-		i := model.Target.PixOffset(line.X1, line.Y)
-		for x := line.X1; x <= line.X2; x++ {
-			count++
-			tr := float64(model.Target.Pix[i])
-			tg := float64(model.Target.Pix[i+1])
-			tb := float64(model.Target.Pix[i+2])
-			cr := float64(model.Current.Pix[i])
-			cg := float64(model.Current.Pix[i+1])
-			cb := float64(model.Current.Pix[i+2])
-			i += 4
-			rsum += (a*cr - cr + tr) / a
-			gsum += (a*cg - cg + tg) / a
-			bsum += (a*cb - cb + tb) / a
-		}
-	}
-	if count == 0 {
-		return Color{}
-	}
-	r := clampInt(int(rsum/float64(count)), 0, 255)
-	g := clampInt(int(gsum/float64(count)), 0, 255)
-	b := clampInt(int(bsum/float64(count)), 0, 255)
-	return Color{r, g, b, alpha}
-}
-
-func (model *Model) computeScore(lines []Scanline, c Color, buffer *image.RGBA) float64 {
-	copy(buffer.Pix, model.Current.Pix)
-	Draw(buffer, c, lines)
-	return differencePartial(model.Target, model.Current, buffer, model.Score, lines)
-}
-
-func (model *Model) Energy(shape Shape, buffer *image.RGBA) float64 {
-	lines := shape.Rasterize()
-	c := model.computeColor(lines, model.Alpha)
-	s := model.computeScore(lines, c, buffer)
-	return s
+func (model *Model) runWorker(worker *Worker, t ShapeType, a, n, age, m int, ch chan *State) {
+	ch <- worker.BestHillClimbState(t, a, n, age, m)
 }
